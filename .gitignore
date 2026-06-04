@@ -1,0 +1,22 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# env files (never commit secrets)
+.env
+.env*.local
+.vercel
+
+# generated knowledge base (rebuilt at build time)
+/lib/knowledge.ts
+
+# misc
+.DS_Store
+*.pem
+npm-debug.log*
