@@ -1,27 +1,68 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { SYSTEM_PROMPT } from "@/lib/prompt";
 
-// Run on the Node.js runtime so the Anthropic SDK and streaming work cleanly.
+// This route does NOT use an Anthropic API key. Instead it shells out to the
+// locally-installed, already-authenticated Claude Code CLI, which answers using
+// your Claude subscription (the same account as the desktop app). No key, no
+// billing, runs entirely on your Mac.
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 120;
 
-const MODEL = "claude-sonnet-4-6";
-const MAX_TURNS = 12; // cap how much history we forward to keep things snappy
+const MODEL = process.env.CHAT_MODEL || "sonnet";
+
+// Tools we never want the chatbot to reach for — this is a pure Q&A over the
+// newsletters, so block file/web/shell access entirely.
+const DISALLOWED_TOOLS = [
+  "Bash",
+  "Edit",
+  "Write",
+  "Read",
+  "Glob",
+  "Grep",
+  "WebSearch",
+  "WebFetch",
+  "Task",
+  "NotebookEdit",
+];
 
 interface ClientMessage {
   role: "user" | "assistant";
   content: string;
 }
 
-export async function POST(req: Request) {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return Response.json(
-      { error: "The chatbot isn't configured yet — ANTHROPIC_API_KEY is missing." },
-      { status: 500 }
-    );
-  }
+// Find the Claude CLI without depending on the server's PATH (Next dev may be
+// launched from a shell that doesn't include the npm-global bin dir).
+function resolveClaudeBin(): string {
+  if (process.env.CLAUDE_CLI_PATH) return process.env.CLAUDE_CLI_PATH;
+  const home = homedir();
+  const candidates = [
+    join(home, ".npm-global/bin/claude"),
+    "/usr/local/bin/claude",
+    "/opt/homebrew/bin/claude",
+    join(home, ".local/bin/claude"),
+  ];
+  for (const c of candidates) if (existsSync(c)) return c;
+  return "claude"; // fall back to PATH
+}
 
+// Render the conversation into a single prompt for the CLI. The system prompt
+// (persona + newsletters + rules) is passed separately via --system-prompt.
+function buildPrompt(history: ClientMessage[]): string {
+  const lines = history.map((m) =>
+    m.role === "user" ? `[Visitor]: ${m.content}` : `[Ruben]: ${m.content}`
+  );
+  return (
+    "Here is the conversation so far. Reply to the final visitor message as Ruben, " +
+    "following your system instructions.\n\n" +
+    lines.join("\n\n") +
+    "\n\n[Ruben]:"
+  );
+}
+
+export async function POST(req: Request) {
   let messages: ClientMessage[];
   try {
     const body = await req.json();
@@ -30,7 +71,6 @@ export async function POST(req: Request) {
     return Response.json({ error: "Invalid request body." }, { status: 400 });
   }
 
-  // Keep only well-formed turns, trim to the most recent exchange.
   const history = messages
     .filter(
       (m) =>
@@ -39,48 +79,89 @@ export async function POST(req: Request) {
         typeof m.content === "string" &&
         m.content.trim().length > 0
     )
-    .slice(-MAX_TURNS)
-    .map((m) => ({ role: m.role, content: m.content }));
+    .slice(-12);
 
   if (history.length === 0 || history[history.length - 1].role !== "user") {
     return Response.json({ error: "No question to answer." }, { status: 400 });
   }
 
-  const anthropic = new Anthropic({ apiKey });
+  const bin = resolveClaudeBin();
+  const args = [
+    "--print",
+    "--system-prompt",
+    SYSTEM_PROMPT,
+    "--exclude-dynamic-system-prompt-sections",
+    "--model",
+    MODEL,
+    "--strict-mcp-config",
+    "--mcp-config",
+    '{"mcpServers":{}}',
+    "--disallowedTools",
+    ...DISALLOWED_TOOLS,
+  ];
 
   const encoder = new TextEncoder();
-  const stream = new ReadableStream({
-    async start(controller) {
-      try {
-        const llmStream = anthropic.messages.stream({
-          model: MODEL,
-          max_tokens: 1024,
-          system: [
-            {
-              type: "text",
-              text: SYSTEM_PROMPT,
-              // Cache the large, static knowledge-base prompt across requests.
-              cache_control: { type: "ephemeral" },
-            },
-          ],
-          messages: history,
-        });
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      // Run in a neutral temp dir so the CLI doesn't pick up any project
+      // CLAUDE.md, settings, or local context.
+      const child = spawn(bin, args, {
+        cwd: tmpdir(),
+        env: { ...process.env },
+      });
 
-        llmStream.on("text", (text) => {
-          controller.enqueue(encoder.encode(text));
-        });
+      let sawOutput = false;
+      let stderr = "";
+      let closed = false;
+      const safeClose = () => {
+        if (!closed) {
+          closed = true;
+          try {
+            controller.close();
+          } catch {
+            /* already closed */
+          }
+        }
+      };
 
-        await llmStream.finalMessage();
-        controller.close();
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "Something went wrong.";
-        // Surface a readable error into the stream so the UI can show it.
+      child.stdout.on("data", (chunk: Buffer) => {
+        sawOutput = true;
+        controller.enqueue(new Uint8Array(chunk));
+      });
+
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+
+      child.on("error", (err) => {
         controller.enqueue(
-          encoder.encode(`\n\n⚠️ Sorry, I hit an error: ${message}`)
+          encoder.encode(
+            `⚠️ Couldn't start the Claude CLI (${err.message}). Make sure it's installed and you've run \`claude\` once to log in.`
+          )
         );
-        controller.close();
-      }
+        safeClose();
+      });
+
+      child.on("close", (code) => {
+        if (!sawOutput) {
+          const hint = /not logged in|\/login|authenticat/i.test(stderr)
+            ? "It looks like the Claude CLI isn't logged in yet. Open a terminal, run `claude`, and sign in with your Claude account — then try again."
+            : stderr.trim() ||
+              `The Claude CLI exited with code ${code} and no output.`;
+          controller.enqueue(encoder.encode(`⚠️ ${hint}`));
+        }
+        safeClose();
+      });
+
+      // Feed the conversation to the CLI via stdin.
+      child.stdin.write(buildPrompt(history));
+      child.stdin.end();
+
+      // If the client disconnects, kill the child.
+      req.signal?.addEventListener("abort", () => {
+        child.kill("SIGTERM");
+        safeClose();
+      });
     },
   });
 
